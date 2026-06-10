@@ -1,320 +1,245 @@
 /**
- * worker.js — spawns and manages Python inference child processes.
+ * worker.js — spawns Python inference child processes.
  *
- * Each (camera_id, model_id) pair gets exactly ONE Python process.
- * The process is launched with the model's script_path and communicates
- * via stdout JSON lines (one JSON object per detection cycle).
+ * person.py CLI interface (from parse_args):
+ *   --library   <path>      required, path to libnn_yolo26s.so
+ *   --model     <path>      required, path to yolo26s.nb
+ *   --type      rtsp        source type
+ *   --device    <url>       RTSP URL (or use --rtsp <url> alias)
+ *   --conf      <float>     confidence threshold
+ *   --nms       <float>     NMS IoU threshold
+ *   --transport tcp|udp
+ *   --json-stream           print JSON lines to stdout (keeps stderr clean)
+ *   --jpeg-quality <int>    JPEG quality for embedded snapshots
+ *   --headless              implied by --json-stream, but explicit is fine
+ *   --low-light             enable CLAHE preprocessing
  *
- * Architecture:
- *   Node.js (this file)
- *     └─ spawn()  → python3 detectors/person.py --rtsp ... --model ... --conf ...
- *                     └─ writes person_live.json atomically each frame
- *                     └─ also prints JSON to stdout for Node to read live
+ * JSON output line (one per frame):
+ *   {"frame":N, "fps":F, "inference_ms":T, "detections":[...], "jpeg":"<b64>"}
  */
 
 const { spawn } = require('child_process');
 const path = require('path');
-const { workers, models, cameras, pushLog } = require('../store');
+const { workers, cameras, models, pushLog } = require('../store');
 
-const DETECTORS_PATH = process.env.DETECTORS_PATH || path.join(__dirname, '../../detectors');
-const MODELS_PATH = process.env.MODELS_PATH || path.join(__dirname, '../../models');
-const ASNN_LIBRARY = process.env.ASNN_LIBRARY_PATH || './lib/libnn_yolo26s.so';
+// Absolute paths relative to project root (vision-backend/)
+const PROJECT_ROOT  = path.join(__dirname, '../..');
+const DETECTORS_DIR = path.join(PROJECT_ROOT, 'detectors');
+const MODELS_DIR    = path.join(PROJECT_ROOT, 'models');
+const LIB_DIR       = path.join(PROJECT_ROOT, 'lib');
 
-/**
- * Build CLI args for each detector script.
- * Each script follows the same interface as person.py.
- */
-function buildArgs(camera, model, config, enabledCapabilities) {
-  const { localRtsp } = require('./mediamtx');
-  const rtspUrl = localRtsp(camera.id);
+// Model file map: modelId → { script, modelFile, library }
+const MODEL_FILES = {
+  mdl_person: {
+    script:    'person.py',
+    modelFile: 'yolo26s.nb',          // lives at models/yolo26s.nb
+    library:   'libnn_yolo26s.so',
+  },
+  // Add more as you build them:
+  // mdl_face: { script: 'face.py', modelFile: 'face/face.nb', library: 'libnn_face.so' },
+  // mdl_fire: { script: 'fire_smoke.py', modelFile: 'fire/fire.nb', library: 'libnn_fire.so' },
+  // mdl_ppe:  { script: 'ppe.py', modelFile: 'ppe/ppe.nb', library: 'libnn_ppe.so' },
+};
 
-  const baseArgs = [
-    path.join(DETECTORS_PATH, model.script_path.replace('detectors/', '')),
-    '--rtsp', rtspUrl,
-    '--model', path.join(MODELS_PATH, model.model_path.replace('models/', '')),
-    '--library', model.library_path || ASNN_LIBRARY,
-    '--conf', String(config.confidence || 0.45),
-    '--nms', String(config.nms || 0.56),
-    '--headless',
-    '--json-stream',   // our scripts accept this flag to print JSON to stdout
-  ];
-
-  if (config.fps) baseArgs.push('--fps', String(config.fps));
-
-  // Sub-capability flags — scripts accept e.g. --enable-gender-classification
-  if (enabledCapabilities && enabledCapabilities.length > 0) {
-    enabledCapabilities.forEach(cap => {
-      baseArgs.push(`--enable-${cap.replace(/_/g, '-')}`);
-    });
-  }
-
-  if (config.zone) {
-    baseArgs.push('--zone', JSON.stringify(config.zone));
-  }
-
-  return baseArgs;
-}
-
-const workerKey = (camId, modelId) => `${camId}::${modelId}`;
-
-/**
- * Start an inference worker for a camera+model pair.
- *
- * @param {string} cameraId
- * @param {string} modelId
- * @param {object} config  - { confidence, fps, nms, zone }
- * @param {string[]} enabledCapabilities - subset of model.capabilities to activate
- * @returns {{ worker_pid, status, stream }}
- */
 function startWorker(cameraId, modelId, config = {}, enabledCapabilities = []) {
-  const key = workerKey(cameraId, modelId);
+  const key = `${cameraId}::${modelId}`;
+
   if (workers.has(key)) {
-    throw new Error(`Worker already running for ${cameraId} + ${modelId}`);
+    const w = workers.get(key);
+    return { success: true, workerId: key, pid: w.pid, message: 'Already running' };
   }
 
   const camera = cameras.get(cameraId);
   if (!camera) throw new Error(`Camera ${cameraId} not found`);
 
-  const model = models.get(modelId);
-  if (!model) throw new Error(`Model ${modelId} not found`);
+  const modelDef = MODEL_FILES[modelId];
+  if (!modelDef) throw new Error(`Model ${modelId} not supported yet. Available: ${Object.keys(MODEL_FILES).join(', ')}`);
 
-  // Activate only requested capabilities (default: all)
-  const caps = enabledCapabilities.length > 0
-    ? enabledCapabilities.filter(c => model.capabilities.includes(c))
-    : model.capabilities;
+  // Use MediaMTX local re-stream URL so the detector gets a stable local feed
+  const rtspUrl = camera.local_rtsp || `rtsp://localhost:8554/${cameraId}`;
 
-  const args = buildArgs(camera, model, config, caps);
+  const scriptPath  = path.join(DETECTORS_DIR, modelDef.script);
+  const modelPath   = path.join(MODELS_DIR, modelDef.modelFile);
+  const libraryPath = path.join(LIB_DIR, modelDef.library);
 
-  // ── In production: un-comment the real spawn ──────────────────────────────
- const proc = spawn('python3', args, {
-   stdio: ['ignore', 'pipe', 'pipe'],
-   env: { ...process.env },
- });
-  //
- proc.stdout.on('data', data => {
-   data.toString().split('\n').filter(Boolean).forEach(line => {
-     try {
-       const payload = JSON.parse(line);
-       desc.lastResult = payload;
-       desc.fps = payload.fps || desc.fps;
-       desc.inference_ms = payload.inference_ms || desc.inference_ms;
-     } catch {}
-   });
- });
-  //
- proc.stderr.on('data', d => console.error(`[worker ${key}]`, d.toString()));
-  //
- proc.on('exit', code => {
-   console.log(`[worker ${key}] exited with code ${code}`);
-   pushLog(cameraId, { event: 'worker_exit', code, model_id: modelId });
-   workers.delete(key);
- });
-  // ─────────────────────────────────────────────────────────────────────────
+  const args = [
+    '--library',      libraryPath,
+    '--model',        modelPath,
+    '--type',         'rtsp',
+    '--device',       rtspUrl,
+    '--conf',         String(config.confidence || 0.45),
+    '--nms',          String(config.nms || 0.56),
+    '--transport',    'tcp',
+    '--jpeg-quality', String(config.jpegQuality || 75),
+    '--json-stream',                    // JSON on stdout, logs on stderr
+  ];
 
-  // ── MOCK process (for API testing without NPU hardware) ──────────────────
-  const mockPid = Math.floor(10000 + Math.random() * 50000);
-//  const proc = {
-  //  pid: mockPid,
-  //  killed: false,
-  //  kill: function () { this.killed = true; workers.delete(key); },
- // };
+  if (config.lowLight) args.push('--low-light');
 
-  // Simulate live detection results updating periodically
-  const { localRtsp } = require('./mediamtx');
-  const mockInterval = setInterval(() => {
-    if (!workers.has(key)) { clearInterval(mockInterval); return; }
-    const desc = workers.get(key);
-    desc.fps = parseFloat((12 + Math.random() * 6).toFixed(1));
-    desc.inference_ms = parseFloat((30 + Math.random() * 20).toFixed(1));
-    desc.lastResult = generateMockResult(model, caps, cameraId);
-  }, 500);
-  // ─────────────────────────────────────────────────────────────────────────
+  console.log(`[worker ${key}] Spawning: python3 ${modelDef.script}`);
+  console.log(`[worker ${key}]   rtsp  : ${rtspUrl}`);
+  console.log(`[worker ${key}]   model : ${modelPath}`);
+  console.log(`[worker ${key}]   lib   : ${libraryPath}`);
 
-  const desc = {
-    camera_id: cameraId,
-    model_id: modelId,
-    pid: proc.pid,
-    fps: 0,
-    inference_ms: 0,
-    status: 'running',
-    enabled_capabilities: caps,
-    config: { ...config },
-    started_at: new Date().toISOString(),
-    stream: localRtsp(cameraId),
+  const proc = spawn('python3', [scriptPath, ...args], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    cwd: DETECTORS_DIR,
+    env: { ...process.env, PYTHONUNBUFFERED: '1' },
+  });
+
+  if (!proc.pid) {
+    throw new Error('Failed to spawn python3 — is it installed and on PATH?');
+  }
+
+  const workerData = {
+    camera_id:           cameraId,
+    model_id:            modelId,
+    pid:                 proc.pid,
+    status:              'running',
+    started_at:          new Date().toISOString(),
+    fps:                 0,
+    inference_ms:        0,
+    enabled_capabilities: enabledCapabilities.length > 0 ? enabledCapabilities : ['person_detection'],
+    config:              { ...config },
+    local_rtsp:          rtspUrl,
     proc,
-    lastResult: null,
-    _mockInterval: mockInterval,
+    lastResult:          null,
   };
 
-  workers.set(key, desc);
+  workers.set(key, workerData);
 
-  // Track assignment on camera + model
-  if (!camera.assigned_models) camera.assigned_models = [];
-  if (!camera.assigned_models.includes(modelId)) camera.assigned_models.push(modelId);
-  if (!model.assigned_cameras.includes(cameraId)) model.assigned_cameras.push(cameraId);
+  // ── stdout: JSON detection lines ──────────────────────────────────────────
+  let stdoutBuf = '';
+  proc.stdout.on('data', (chunk) => {
+    stdoutBuf += chunk.toString();
+    const lines = stdoutBuf.split('\n');
+    stdoutBuf = lines.pop(); // keep incomplete last line in buffer
 
-  pushLog(cameraId, { event: 'worker_start', model_id: modelId, pid: proc.pid, capabilities: caps });
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || !trimmed.startsWith('{')) continue;
+      try {
+        const result = JSON.parse(trimmed);
 
-  return { worker_pid: proc.pid, status: 'running', stream: localRtsp(cameraId) };
+        // Update live metrics
+        if (result.fps)          workerData.fps = result.fps;
+        if (result.inference_ms) workerData.inference_ms = result.inference_ms;
+
+        // Attach camera/model context for API consumers
+        result.camera_id  = cameraId;
+        result.model_id   = modelId;
+        result.updated_at = new Date().toISOString();
+
+        workerData.lastResult = result;
+      } catch {
+        // Not JSON — print for debugging
+        console.log(`[worker ${key}] stdout: ${trimmed}`);
+      }
+    }
+  });
+
+  // ── stderr: Python logs ───────────────────────────────────────────────────
+  proc.stderr.on('data', (chunk) => {
+    const msg = chunk.toString().trim();
+    if (msg) console.error(`[worker ${key}] ${msg}`);
+  });
+
+  // ── exit ──────────────────────────────────────────────────────────────────
+  proc.on('close', (code, signal) => {
+    console.log(`[worker ${key}] exited — code=${code} signal=${signal}`);
+    workers.delete(key);
+
+    // Remove from camera assignment tracking
+    const cam = cameras.get(cameraId);
+    if (cam) cam.assigned_models = (cam.assigned_models || []).filter(m => m !== modelId);
+
+    const model = models.get(modelId);
+    if (model) model.assigned_cameras = model.assigned_cameras.filter(c => c !== cameraId);
+
+    if (pushLog) pushLog(cameraId, { event: 'worker_exit', model_id: modelId, code });
+  });
+
+  proc.on('error', (err) => {
+    console.error(`[worker ${key}] spawn error: ${err.message}`);
+    workers.delete(key);
+  });
+
+  // Bookkeeping
+  const cam = cameras.get(cameraId);
+  if (cam && !cam.assigned_models?.includes(modelId)) {
+    cam.assigned_models = [...(cam.assigned_models || []), modelId];
+  }
+  const model = models.get(modelId);
+  if (model && !model.assigned_cameras?.includes(cameraId)) {
+    model.assigned_cameras = [...(model.assigned_cameras || []), cameraId];
+  }
+
+  if (pushLog) pushLog(cameraId, { event: 'worker_start', model_id: modelId, pid: proc.pid });
+
+  return {
+    worker_pid: proc.pid,
+    status:     'running',
+    stream:     rtspUrl,
+    workerId:   key,
+  };
 }
 
-/**
- * Stop a specific worker.
- */
 function stopWorker(cameraId, modelId) {
-  const key = workerKey(cameraId, modelId);
-  const desc = workers.get(key);
-  if (!desc) throw new Error(`No running worker for ${cameraId} + ${modelId}`);
+  const key = `${cameraId}::${modelId}`;
+  const worker = workers.get(key);
+  if (!worker) throw new Error(`No running worker for ${key}`);
 
-  if (desc._mockInterval) clearInterval(desc._mockInterval);
-  desc.proc.kill('SIGTERM');
+  worker.proc.kill('SIGTERM');
   workers.delete(key);
 
-  // Remove assignment bookkeeping
-  const camera = cameras.get(cameraId);
-  if (camera) camera.assigned_models = (camera.assigned_models || []).filter(m => m !== modelId);
+  const cam = cameras.get(cameraId);
+  if (cam) cam.assigned_models = (cam.assigned_models || []).filter(m => m !== modelId);
   const model = models.get(modelId);
   if (model) model.assigned_cameras = model.assigned_cameras.filter(c => c !== cameraId);
 
-  pushLog(cameraId, { event: 'worker_stop', model_id: modelId });
+  if (pushLog) pushLog(cameraId, { event: 'worker_stop', model_id: modelId });
+
   return { status: 'stopped' };
 }
 
-/**
- * Stop ALL workers (e.g. before OTA update).
- */
 function stopAllWorkers() {
   let count = 0;
-  for (const [key, desc] of workers.entries()) {
-    if (desc._mockInterval) clearInterval(desc._mockInterval);
-    desc.proc.kill('SIGTERM');
+  for (const [key, w] of workers.entries()) {
+    w.proc.kill('SIGTERM');
     workers.delete(key);
     count++;
   }
   return { stopped: count };
 }
 
-/**
- * Update config on a running worker without restarting.
- * The Python script reads a control file or accepts SIGUSR1; here we
- * just update the in-memory descriptor (real impl would signal the proc).
- */
 function updateWorkerConfig(cameraId, modelId, patch) {
-  const key = workerKey(cameraId, modelId);
-  const desc = workers.get(key);
-  if (!desc) throw new Error(`No running worker for ${cameraId} + ${modelId}`);
-  Object.assign(desc.config, patch);
-  // In production: write a config file or send SIGUSR1 to desc.proc.pid
+  const key = `${cameraId}::${modelId}`;
+  const w = workers.get(key);
+  if (!w) throw new Error(`No running worker for ${key}`);
+  Object.assign(w.config, patch);
+  // In production: write a config file that the Python script watches via inotify
   return { updated: true };
 }
 
-/**
- * Update the detection zone polygon for a running worker.
- */
 function updateWorkerZone(cameraId, modelId, zone) {
-  const key = workerKey(cameraId, modelId);
-  const desc = workers.get(key);
-  if (!desc) throw new Error(`No running worker for ${cameraId} + ${modelId}`);
-  desc.config.zone = zone;
-  // In production: write zone to a shared file that the Python script watches
+  const key = `${cameraId}::${modelId}`;
+  const w = workers.get(key);
+  if (!w) throw new Error(`No running worker for ${key}`);
+  w.config.zone = zone;
   return { updated: true };
 }
 
-/**
- * Get the latest result from a running worker.
- */
 function getWorkerResult(cameraId, modelId) {
-  const key = workerKey(cameraId, modelId);
-  const desc = workers.get(key);
-  if (!desc) return null;
-  return desc.lastResult;
+  const key = `${cameraId}::${modelId}`;
+  const w = workers.get(key);
+  return w?.lastResult || null;
 }
 
-// ── Mock result generators per model type ────────────────────────────────────
-
-function generateMockResult(model, caps, cameraId) {
-  const base = {
-    updated_unix: Date.now() / 1000,
-    updated_local: new Date().toLocaleString(),
-    camera_id: cameraId,
-    model_id: model.id,
-    enabled_capabilities: caps,
-    fps: parseFloat((12 + Math.random() * 6).toFixed(1)),
-    inference_ms: parseFloat((30 + Math.random() * 20).toFixed(1)),
-  };
-
-  switch (model.id) {
-    case 'mdl_person': return mockPersonResult(base);
-    case 'mdl_face':   return mockFaceResult(base, caps);
-    case 'mdl_fire':   return mockFireResult(base, caps);
-    case 'mdl_ppe':    return mockPpeResult(base, caps);
-    default:           return { ...base, detections: [] };
-  }
-}
-
-function randBox() {
-  const x1 = Math.random() * 0.6;
-  const y1 = Math.random() * 0.6;
-  return { x1_norm: x1, y1_norm: y1, x2_norm: x1 + 0.1 + Math.random() * 0.25, y2_norm: y1 + 0.2 + Math.random() * 0.35 };
-}
-
-function mockPersonResult(base) {
-  const count = Math.random() > 0.3 ? Math.ceil(Math.random() * 3) : 0;
-  const persons = Array.from({ length: count }, (_, i) => ({
-    index: i,
-    score: parseFloat((0.45 + Math.random() * 0.5).toFixed(3)),
-    ...randBox(),
-  }));
-  return { ...base, any_person: count > 0, person_count: count, persons };
-}
-
-function mockFaceResult(base, caps) {
-  const GENDERS = ['male', 'female'];
-  const NAMES = ['Alice', 'Bob', 'Charlie', 'Unknown'];
-  const count = Math.random() > 0.4 ? Math.ceil(Math.random() * 2) : 0;
-  const faces = Array.from({ length: count }, (_, i) => {
-    const face = { index: i, score: parseFloat((0.5 + Math.random() * 0.45).toFixed(3)), ...randBox() };
-    if (caps.includes('gender_classification')) {
-      face.gender = GENDERS[Math.floor(Math.random() * 2)];
-      face.gender_score = parseFloat((0.7 + Math.random() * 0.28).toFixed(3));
-    }
-    if (caps.includes('face_recognition')) {
-      face.identity = NAMES[Math.floor(Math.random() * NAMES.length)];
-      face.identity_score = face.identity === 'Unknown' ? null : parseFloat((0.6 + Math.random() * 0.38).toFixed(3));
-    }
-    return face;
-  });
-  return { ...base, face_count: count, faces };
-}
-
-function mockFireResult(base, caps) {
-  const events = [];
-  if (caps.includes('fire_detection') && Math.random() > 0.85) {
-    events.push({ type: 'fire', score: parseFloat((0.6 + Math.random() * 0.35).toFixed(3)), ...randBox() });
-  }
-  if (caps.includes('smoke_detection') && Math.random() > 0.9) {
-    events.push({ type: 'smoke', score: parseFloat((0.55 + Math.random() * 0.4).toFixed(3)), ...randBox() });
-  }
-  return { ...base, alert: events.length > 0, events };
-}
-
-function mockPpeResult(base, caps) {
-  const items = [];
-  const violations = [];
-  const capMap = {
-    helmet_detection: 'helmet',
-    vest_detection: 'vest',
-    gloves_detection: 'gloves',
-  };
-  caps.forEach(cap => {
-    if (capMap[cap] && Math.random() > 0.4) {
-      const worn = Math.random() > 0.2;
-      const item = { type: capMap[cap], worn, score: parseFloat((0.6 + Math.random() * 0.35).toFixed(3)), ...randBox() };
-      items.push(item);
-      if (!worn && caps.includes('no_ppe_alert')) violations.push(capMap[cap]);
-    }
-  });
-  return { ...base, ppe_items: items, violations, alert: violations.length > 0 };
-}
-
-module.exports = { startWorker, stopWorker, stopAllWorkers, updateWorkerConfig, updateWorkerZone, getWorkerResult, workerKey };
+module.exports = {
+  startWorker,
+  stopWorker,
+  stopAllWorkers,
+  updateWorkerConfig,
+  updateWorkerZone,
+  getWorkerResult,
+};
