@@ -38,7 +38,7 @@ const MODEL_FILES = {
   },
   // Add more as you build them:
   // mdl_face: { script: 'face.py', modelFile: 'face/face.nb', library: 'libnn_face.so' },
-  // mdl_fire: { script: 'fire_smoke.py', modelFile: 'fire/fire.nb', library: 'libnn_fire.so' },
+   mdl_fire: { script: 'fire_smoke.py', modelFile: 'fire/fire.nb', library: 'libnn_fire.so' },
   // mdl_ppe:  { script: 'ppe.py', modelFile: 'ppe/ppe.nb', library: 'libnn_ppe.so' },
 };
 
