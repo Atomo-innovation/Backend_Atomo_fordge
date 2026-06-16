@@ -21,6 +21,7 @@ app.use('/api/cameras', require('./routes/cameras'));
 app.use('/api/models',  require('./routes/models'));
 app.use('/api/detect',  require('./routes/detect'));
 app.use('/api/face',    require('./routes/face'));
+app.use('/api/system',  require('./routes/system'));
 
 // Serve face crop images at  GET /crops/<filename>
 app.use('/crops', express.static(path.join(__dirname, '..', 'data', 'crops')));
@@ -90,7 +91,8 @@ app.use((err, req, res, _next) => {
   console.error(err);
   res.status(500).json({ error: err.message || 'Internal server error' });
 });
-
+const { startPoller } = require('./services/systemStore');
+startPoller();   // collect every 5 s, keep 60 min of history
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
   console.log(`\n  Vision Backend running on http://localhost:${PORT}`);
