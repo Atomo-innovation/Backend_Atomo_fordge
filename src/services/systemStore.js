@@ -26,21 +26,39 @@ const history = [];
 // Amlogic VIM3 / A311D — galcore kernel module exposes load at this path.
 // Falls back gracefully on non-VIM3 hardware (dev laptop, etc.).
 const NPU_LOAD_PATHS = [
-  '/sys/kernel/debug/gc/clk',                       // older galcore
-  '/sys/devices/platform/soc/ffe40000.npu/load',    // some BSP builds
-  '/sys/class/misc/galcore/device/load_percent',
+  process.env.NPU_SYSFS_PATH,                    // allow override via .env
+  '/sys/kernel/debug/galcore/load',              // ← Correct path for your board
+  '/sys/kernel/debug/galcore/status',
+  '/sys/devices/platform/ff100000.galcore/load',
 ];
 
 function readNpuLoad() {
-  for (const p of NPU_LOAD_PATHS) {
+  for (const p of NPU_LOAD_PATHS.filter(Boolean)) {
     try {
+      if (!fs.existsSync(p)) continue;
+
       const raw = fs.readFileSync(p, 'utf8').trim();
-      // The file may contain "load: 42 %" or just "42"
-      const m = raw.match(/(\d+(\.\d+)?)/);
-      if (m) return Math.min(100, parseFloat(m[1]));
-    } catch { /* not available */ }
+      console.log(`[systemStore] NPU raw from ${p}: ${raw}`);
+
+      // Parse formats like:
+      // "core : 0\nload : 27%"
+      const match = raw.match(/load\s*:\s*(\d+)/i);
+      if (match) {
+        const load = parseFloat(match[1]);
+        return Math.min(100, Math.round(load));
+      }
+
+      // Fallback: extract any number
+      const numMatch = raw.match(/(\d+(\.\d+)?)/);
+      if (numMatch) {
+        const load = parseFloat(numMatch[1]);
+        return load <= 100 ? Math.round(load) : null;
+      }
+    } catch (err) {
+      // silent - try next path
+    }
   }
-  return null;   // null = not readable on this device
+  return null;   // NPU not available on this hardware
 }
 
 // ── Device info (read once) ───────────────────────────────────────────────────
@@ -58,8 +76,13 @@ async function getDeviceInfo() {
 
   // NPU driver version from sysfs / dmesg fallback
   let npu_driver = 'unknown';
-  try { npu_driver = fs.readFileSync('/sys/module/galcore/version', 'utf8').trim(); } catch {}
-
+  try {
+    npu_driver = fs.readFileSync('/sys/kernel/debug/galcore/version', 'utf8').trim();
+  } catch {
+    try {
+      npu_driver = fs.readFileSync('/sys/module/galcore/version', 'utf8').trim();
+    } catch {}
+  }
   // License stub — replace with real license check in production
   let license_status = 'unlicensed';
   try {
