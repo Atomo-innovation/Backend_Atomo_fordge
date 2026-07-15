@@ -6,15 +6,8 @@ import base64
 import random
 import threading
 import cv2 as cv
-cv.setNumThreads(1)
 import numpy as np
-
-# huggingface_hub is only needed as a fallback when local model files
-# are missing. Import lazily so the script works fully offline.
-# try:
-#     from huggingface_hub import hf_hub_download
-# except ImportError:
-#     hf_hub_download = None
+# from huggingface_hub import hf_hub_download
 
 # Print to stderr for debugging so stdout remains clean JSON
 def log(msg):
@@ -200,8 +193,8 @@ def extract_best_face_embedding(img_path):
     x, y, w, h = best_face[:4].astype(int)
     conf = best_face[-1]
     
-    if conf < 0.90:
-        raise ValueError(f"Face detection confidence is too low ({conf:.2f} < 0.90). Use a clearer photo.")
+    if conf < 0.80:
+        raise ValueError(f"Face detection confidence is too low ({conf:.2f} < 0.80). Use a clearer photo.")
     if w < 80 or h < 80:
         raise ValueError(f"Face is too small ({w}x{h} < 80x80 pixels). Use a closer photo of the face.")
         
@@ -235,11 +228,8 @@ def compare_face_features(feat, threshold, dis_type, thread_recog):
         # Sort scores: Cosine -> descending (highest first); L2 -> ascending (lowest first)
         scores.sort(reverse=(dis_type == 0))
         
-        # Take the average of the top 2 matches if available, to filter out outlier templates
-        if len(scores) >= 2:
-            best_cand_score = (scores[0] + scores[1]) / 2.0
-        else:
-            best_cand_score = scores[0]
+        # Use nearest-neighbor match (highest score among all enrolled templates of this person)
+        best_cand_score = scores[0]
             
         cand_scores.append({
             "person_id": cand_id,
@@ -262,25 +252,8 @@ def compare_face_features(feat, threshold, dis_type, thread_recog):
     is_match = False
     if dis_type == 0: # Cosine
         is_match = best_score >= threshold
-        
-        # If there are multiple candidates, apply the "second-best match gap" constraint
-        # to prevent strangers from matching when they get a marginal score close to multiple people.
-        if is_match and len(cand_scores) > 1:
-            second_best_score = cand_scores[1]["score"]
-            # If the match is marginal (score is between threshold and threshold+0.12),
-            # require a significant gap (at least 0.08) between the best and second-best candidate match.
-            if best_score < (threshold + 0.12):
-                gap = best_score - second_best_score
-                if gap < 0.08: # If gap is too small, it's likely a stranger matching both. Reject it!
-                    is_match = False
     else: # L2
         is_match = best_score <= threshold
-        if is_match and len(cand_scores) > 1:
-            second_best_score = cand_scores[1]["score"]
-            if best_score > (threshold - 0.20):
-                gap = second_best_score - best_score
-                if gap < 0.12:
-                    is_match = False
                     
     if is_match:
         return {"person_id": best_cand["person_id"], "name": best_cand["name"]}, best_score
@@ -416,6 +389,7 @@ class VideoGrabber(threading.Thread):
         self.latest_frame = None
         self.need_frame = True  # Start with True so we get the first frame
         self.frame_lock = threading.Lock()
+        self.frame_event = threading.Event() # Set when a new frame is decoded
         self.daemon = True
 
     def run(self):
@@ -433,6 +407,12 @@ class VideoGrabber(threading.Thread):
             try:
                 if self.cap is None or not self.cap.isOpened():
                     log(f"[{self.camera_id}] Connection offline. Reconnecting in {reconnect_delay}s...")
+                    if self.cap is not None:
+                        try:
+                            self.cap.release()
+                        except:
+                            pass
+                        self.cap = None
                     time.sleep(reconnect_delay)
                     if not self.running:
                         break
@@ -459,6 +439,7 @@ class VideoGrabber(threading.Thread):
                     if ok and frame is not None:
                         with self.frame_lock:
                             self.latest_frame = frame
+                        self.frame_event.set() # Notify that a new frame is ready
                         self.need_frame = False
             except Exception as e:
                 log(f"[{self.camera_id}] Exception in VideoGrabber thread loop: {str(e)}")
@@ -478,17 +459,26 @@ class VideoGrabber(threading.Thread):
             self.cap = None
         log(f"[{self.camera_id}] VideoGrabber thread finished.")
 
-    def get_frame(self):
-        with self.frame_lock:
-            frame = self.latest_frame
-        self.need_frame = True  # Request next frame decode
-        return frame
+    def get_frame(self, timeout=0.2):
+        # Wait up to 200ms for a new frame to be decoded
+        got_new = self.frame_event.wait(timeout)
+        if got_new:
+            self.frame_event.clear()
+            with self.frame_lock:
+                frame = self.latest_frame
+            self.need_frame = True # Request next frame decode
+            return frame
+        else:
+            # If timeout, return the latest frame to keep processor running
+            with self.frame_lock:
+                return self.latest_frame
 
     def stop(self):
         self.running = False
 
-def rtsp_stream_processor(camera_id, camera_name, rtsp_url, threshold, dis_type, crops_dir, stop_event):
-    log(f"[{camera_id}] Starting camera stream thread: {camera_name}")
+def rtsp_stream_processor(camera_id, camera_name, rtsp_url, threshold, dis_type, crops_dir, 
+                          line_crossing_enabled, line_y, line_direction, line_x_start, line_x_end, stop_event):
+    log(f"[{camera_id}] Starting camera stream thread: {camera_name} (Line Crossing: {line_crossing_enabled}, Y: {line_y}, Dir: {line_direction}, X: {line_x_start}-{line_x_end})")
     
     # Separate thread-local models to prevent race conditions on inference
     thread_detector = YuNet(yunet_path)
@@ -503,7 +493,13 @@ def rtsp_stream_processor(camera_id, camera_name, rtsp_url, threshold, dis_type,
     grabber.start()
     
     last_event_time = {}
-    det_width = 800
+    det_width = 1024
+    
+    # Face tracking state
+    tracked_faces = []
+    next_track_id = 0
+    
+    last_frame_time = 0.0
     
     try:
         while not stop_event.is_set():
@@ -512,6 +508,10 @@ def rtsp_stream_processor(camera_id, camera_name, rtsp_url, threshold, dis_type,
                 time.sleep(0.05)
                 continue
                 
+            now = time.time()
+            dt = now - last_frame_time if last_frame_time > 0.0 else 0.2
+            last_frame_time = now
+            
             h_img, w_img = frame.shape[:2]
             
             # Optimization: Resize frame to 640px width for YuNet face detection (reduces CPU by up to 90% for 1080p feeds)
@@ -528,58 +528,186 @@ def rtsp_stream_processor(camera_id, camera_name, rtsp_url, threshold, dis_type,
             faces = thread_detector.infer(det_frame)
             
             detected_faces_data = []
+            now = time.time()
             
-            for f in faces:
-                # Scale coordinates back to original frame size for accurate crop & SFace feature extraction
-                f_orig = f.copy()
-                if scale != 1.0:
-                    f_orig[:14] = f_orig[:14] / scale
+            if line_crossing_enabled:
+                # ---------------------------------------------------------
+                # Line Crossing Face Detection & Tracking Mode
+                # ---------------------------------------------------------
+                current_tracked = []
+                matched_ids = set()
+                y_line = h_img * line_y
+                x_start = w_img * line_x_start
+                x_end = w_img * line_x_end
+                
+                for f in faces:
+                    f_orig = f.copy()
+                    if scale != 1.0:
+                        f_orig[:14] = f_orig[:14] / scale
+                        
+                    box = f_orig[:4]
+                    x, y, w, h = box.astype(int)
+                    conf = f_orig[-1]
                     
-                box = f_orig[:4]
-                x, y, w, h = box.astype(int)
-                conf = f_orig[-1]
-                
-                # Filter out small faces (width or height < 30px) to prevent false positive matches
-                if w < 30 or h < 30:
-                    continue
-                
-                is_known = False
-                match = None
-                score = 0.0
-                feat = None
-                
-                # Only run SFace recognition on high-confidence face detections (0.80)
-                if conf >= 0.80:
-                    # SFace runs on original frame crop to preserve 100% recognition accuracy
-                    feat = thread_recog.infer(frame, f_orig[:-1])
-                    if feat is not None:
-                        match, score = compare_face_features(feat, threshold, dis_type, thread_recog)
-                        is_known = match is not None
-                
-                now = time.time()
-                person_key = match["person_id"] if is_known else "UNKNOWN"
-                cooldown = 3.0
-                
-                # We only log recognition events for actual matches, or high-confidence unknowns to avoid spam
-                if is_known or conf >= 0.80:
-                    if person_key not in last_event_time or (now - last_event_time[person_key]) > cooldown:
-                        last_event_time[person_key] = now
+                    if w < 15 or h < 15:
+                        continue
                         
-                        crop_filename = crop_and_save_face(frame, box, crops_dir)
-                        
-                        gender = None
-                        if thread_gender_net is not None:
-                            gender = classify_gender(thread_gender_net, frame, box)
+                    cx = x + w / 2
+                    cy = y + h / 2
+                    
+                    best_match = None
+                    best_dist = float('inf')
+                    # Scale search radius dynamically based on frame-step time (dt) to prevent track splits on slow hardware
+                    base_max_dist = w_img * 0.08
+                    max_dist = min(base_max_dist * (dt / 0.2), w_img * 0.20)
+                    
+                    for tf in tracked_faces:
+                        if tf["id"] in matched_ids:
+                            continue
+                        # If a track has already crossed and exited the line, do not match it with a new face above the line
+                        if tf["crossed"] and cy <= y_line:
+                            continue
+                        tx, ty = tf["last_center"]
+                        # Prevent hijacking: if track is crossed, don't match with a face behind the track's movement direction
+                        if tf["crossed"] and len(tf["ys"]) >= 2:
+                            track_dir = tf["ys"][-1] - tf["ys"][0]
+                            if track_dir > 0 and cy < ty: # Moving down, face is above track
+                                continue
+                            elif track_dir < 0 and cy > ty: # Moving up, face is below track
+                                continue
+                        dist = np.sqrt((cx - tx)**2 + (cy - ty)**2)
+                        if dist < max_dist and dist < best_dist:
+                            best_dist = dist
+                            best_match = tf
                             
-                        detected_faces_data.append({
-                            "box": [int(x), int(y), int(w), int(h)],
-                            "score": score,
-                            "match": match,
-                            "is_known": is_known,
-                            "crop_filename": crop_filename,
-                            "embedding": feat.flatten().tolist() if feat is not None else None,
-                            "gender": gender
-                        })
+                    if best_match is not None:
+                        matched_ids.add(best_match["id"])
+                        prev_cy = best_match["last_center"][1]
+                        best_match["last_bbox"] = [x, y, w, h]
+                        best_match["last_center"] = (cx, cy)
+                        best_match["last_seen"] = now
+                        best_match["ys"].append(cy)
+                        if len(best_match["ys"]) > 10:
+                            best_match["ys"].pop(0)
+                            
+                        crossed_trigger = False
+                        if not best_match["crossed"]:
+                            # Check if face trajectory came from the other side of the line
+                            has_started_other_side = False
+                            if line_direction == 'in' or line_direction == 'both':
+                                if cy > y_line:
+                                    # 1. Standard crossing: previous coordinate was above line
+                                    if any(y <= y_line for y in best_match["ys"][:-1]):
+                                        has_started_other_side = True
+                                    # 2. Low-FPS recovery: track started just below the line and is moving down
+                                    elif len(best_match["ys"]) >= 2 and best_match["ys"][-1] > best_match["ys"][0] and best_match["ys"][0] < (y_line + h_img * 0.15):
+                                        has_started_other_side = True
+                            if line_direction == 'out' or line_direction == 'both':
+                                if cy < y_line:
+                                    # 1. Standard crossing: previous coordinate was below line
+                                    if any(y >= y_line for y in best_match["ys"][:-1]):
+                                        has_started_other_side = True
+                                    # 2. Low-FPS recovery: track started just above the line and is moving up
+                                    elif len(best_match["ys"]) >= 2 and best_match["ys"][-1] < best_match["ys"][0] and best_match["ys"][0] > (y_line - h_img * 0.15):
+                                        has_started_other_side = True
+                                        
+                            if has_started_other_side and (x_start <= cx <= x_end):
+                                crossed_trigger = True
+                                    
+                        if crossed_trigger:
+                            # Try recognizing if confidence is sufficient (>= 0.60)
+                            if conf >= 0.55:
+                                best_match["crossed"] = True
+                                log(f"[{camera_id}] Track #{best_match['id']} crossed line Y={int(y_line)} (X span: {int(x_start)}-{int(x_end)}) in direction: {line_direction}")
+                                
+                                is_known = False
+                                match = None
+                                score = 0.0
+                                feat = None
+                                
+                                feat = thread_recog.infer(frame, f_orig[:-1])
+                                if feat is not None:
+                                    match, score = compare_face_features(feat, threshold, dis_type, thread_recog)
+                                    is_known = match is not None
+                                    
+                                    crop_filename = crop_and_save_face(frame, box, crops_dir)
+                                    gender = classify_gender(thread_gender_net, frame, box) if thread_gender_net is not None else None
+                                    
+                                    detected_faces_data.append({
+                                        "box": [int(x), int(y), int(w), int(h)],
+                                        "score": score,
+                                        "match": match,
+                                        "is_known": is_known,
+                                        "crop_filename": crop_filename,
+                                        "embedding": feat.flatten().tolist() if feat is not None else None,
+                                        "gender": gender
+                                    })
+                        current_tracked.append(best_match)
+                    else:
+                        new_tf = {
+                            "id": next_track_id,
+                            "last_bbox": [x, y, w, h],
+                            "last_center": (cx, cy),
+                            "crossed": False,
+                            "last_seen": now,
+                            "ys": [cy]
+                        }
+                        next_track_id += 1
+                        current_tracked.append(new_tf)
+                        
+                # Preserve unmatched tracks for a short period (0.3 seconds) to handle brief dropouts
+                for tf in tracked_faces:
+                    if tf["id"] not in matched_ids:
+                        if now - tf["last_seen"] < 0.3:
+                            current_tracked.append(tf)
+                            
+                tracked_faces = current_tracked
+            else:
+                # ---------------------------------------------------------
+                # Standard Mode (Full Frame Detection on all frames)
+                # ---------------------------------------------------------
+                for f in faces:
+                    f_orig = f.copy()
+                    if scale != 1.0:
+                        f_orig[:14] = f_orig[:14] / scale
+                        
+                    box = f_orig[:4]
+                    x, y, w, h = box.astype(int)
+                    conf = f_orig[-1]
+                    
+                    if w < 15 or h < 15:
+                        continue
+                    
+                    is_known = False
+                    match = None
+                    score = 0.0
+                    feat = None
+                    
+                    if conf >= 0.60:
+                        feat = thread_recog.infer(frame, f_orig[:-1])
+                        if feat is not None:
+                            match, score = compare_face_features(feat, threshold, dis_type, thread_recog)
+                            is_known = match is not None
+                    
+                    person_key = match["person_id"] if is_known else "UNKNOWN"
+                    cooldown = 3.0
+                    
+                    if is_known or conf >= 0.80:
+                        if person_key not in last_event_time or (now - last_event_time[person_key]) > cooldown:
+                            last_event_time[person_key] = now
+                            
+                            crop_filename = crop_and_save_face(frame, box, crops_dir)
+                            gender = classify_gender(thread_gender_net, frame, box) if thread_gender_net is not None else None
+                                
+                            detected_faces_data.append({
+                                "box": [int(x), int(y), int(w), int(h)],
+                                "score": score,
+                                "match": match,
+                                "is_known": is_known,
+                                "crop_filename": crop_filename,
+                                "embedding": feat.flatten().tolist() if feat is not None else None,
+                                "gender": gender
+                            })
             
             # Emit recognition match events for specific camera
             if detected_faces_data:
@@ -587,12 +715,29 @@ def rtsp_stream_processor(camera_id, camera_name, rtsp_url, threshold, dis_type,
                     "event": "stream_match",
                     "camera_id": camera_id,
                     "camera_name": camera_name,
+                    # Original-frame dimensions so the frontend can normalize
+                    # box coordinates and overlay them correctly on any video size,
+                    # and so it can position a line-crossing overlay consistently.
+                    "frame_width": int(w_img),
+                    "frame_height": int(h_img),
+                    "line_crossing": {
+                        "enabled": bool(line_crossing_enabled),
+                        "y": float(line_y),
+                        "direction": line_direction,
+                        "x_start": float(line_x_start),
+                        "x_end": float(line_x_end),
+                    },
                     "faces": detected_faces_data
                 }) + "\n")
                 sys.stdout.flush()
                 
-            # Regulate thread loop rate (~5 FPS per camera stream for VIM3/ARM64 low CPU)
-            time.sleep(0.2)
+            # Regulate thread loop rate adaptively to conserve CPU on ARM64 while preventing frame skips
+            if len(tracked_faces) > 0:
+                # High-speed tracking mode: sleep minimal time to capture every frame
+                time.sleep(0.01)
+            else:
+                # Low-power standby mode: sleep 0.15s (~6.6 FPS) to save CPU when scene is empty
+                time.sleep(0.15)
             
     except Exception as e:
         log(f"[{camera_id}] Error in processor loop: {str(e)}")
@@ -666,6 +811,11 @@ def main():
                 threshold = req.get("threshold", 0.60)
                 dis_type = req.get("dis_type", 0)
                 crops_dir = req.get("crops_dir", ".")
+                line_crossing_enabled = req.get("line_crossing_enabled", False)
+                line_y = req.get("line_y", 0.6)
+                line_direction = req.get("line_direction", "in")
+                line_x_start = req.get("line_x_start", 0.0)
+                line_x_end = req.get("line_x_end", 1.0)
                 
                 with candidates_lock:
                     candidates = local_candidates
@@ -682,7 +832,8 @@ def main():
                     
                     thread = threading.Thread(
                         target=rtsp_stream_processor,
-                        args=(camera_id, camera_name, rtsp_url, threshold, dis_type, crops_dir, stop_event),
+                        args=(camera_id, camera_name, rtsp_url, threshold, dis_type, crops_dir, 
+                              line_crossing_enabled, line_y, line_direction, line_x_start, line_x_end, stop_event),
                         daemon=True
                     )
                     stream_threads[camera_id] = thread
@@ -721,6 +872,28 @@ def main():
                     candidates = local_candidates
                 res = {"status": "success", "message": "Candidates synced across all stream threads."}
                 sys.stdout.write(json.dumps({"cmd": "update_candidates", "response": res}) + "\n")
+                sys.stdout.flush()
+                
+            elif cmd == "add_template":
+                person_id = req.get("person_id")
+                embedding = req.get("embedding")
+                with candidates_lock:
+                    found = False
+                    for cand in candidates:
+                        if cand.get("person_id") == person_id:
+                            if "embeddings" not in cand:
+                                cand["embeddings"] = []
+                            cand["embeddings"].append(embedding)
+                            found = True
+                            break
+                    if not found:
+                        candidates.append({
+                            "person_id": person_id,
+                            "name": req.get("name", "Unknown"),
+                            "embeddings": [embedding]
+                        })
+                res = {"status": "success", "message": "Embedding appended successfully."}
+                sys.stdout.write(json.dumps({"cmd": "add_template", "response": res}) + "\n")
                 sys.stdout.flush()
                 
             else:

@@ -5,6 +5,8 @@ const multer   = require('multer');
 const { requireAuth } = require('../middleware/auth');
 const bridge          = require('../services/faceWorkerBridge');
 const personStore     = require('../services/personStore');
+const clusterStore    = require('../services/clusterStore');
+const lineConfigStore = require('../services/lineConfigStore');
 const { cameras }     = require('../store');
 
 const PROJECT_ROOT = path.join(__dirname, '../..');
@@ -64,6 +66,11 @@ async function ensureWorker(res) {
   }
 }
 
+// Every unrecognized ("is_known: false") face seen on a live stream is fed
+// into clusterStore, which groups recurring strangers by face similarity so
+// they can be reviewed and labeled later via the /clusters endpoints below.
+bridge.on('stream_match', (msg) => clusterStore.ingestStreamMatch(msg));
+
 // ── Worker status ─────────────────────────────────────────────
 router.get('/worker/status', requireAuth, (req, res) => {
   res.json({ running: bridge.isReady(), pid: bridge.proc?.pid || null });
@@ -83,7 +90,14 @@ router.post('/worker/stop', requireAuth, (req, res) => {
 
 // ── Live stream ───────────────────────────────────────────────
 router.post('/stream/start', requireAuth, async (req, res) => {
-  const { camera_id, threshold = 0.60, dis_type = 0 } = req.body || {};
+  const {
+    camera_id, threshold = 0.60, dis_type = 0,
+    // Optional inline line-crossing override. If provided, this also
+    // becomes the new saved config for the camera (same as calling
+    // PUT /stream/line-config/:camera_id first). If omitted, whatever
+    // was last saved for this camera (or the disabled default) is used.
+    line_crossing_enabled, line_y, line_direction, line_x_start, line_x_end,
+  } = req.body || {};
   if (!camera_id) return res.status(400).json({ error: 'camera_id required' });
 
   const cam = cameras.get(camera_id);
@@ -93,6 +107,19 @@ router.post('/stream/start', requireAuth, async (req, res) => {
   try { caps = parseCapabilities(req.body); }
   catch (e) { return res.status(400).json({ error: e.message }); }
 
+  const hasInlineLineConfig = [line_crossing_enabled, line_y, line_direction, line_x_start, line_x_end]
+    .some(v => v !== undefined);
+
+  let lineConfig;
+  try {
+    lineConfig = hasInlineLineConfig
+      ? lineConfigStore.setConfig(camera_id, {
+          enabled: line_crossing_enabled, line_y, direction: line_direction,
+          x_start: line_x_start, x_end: line_x_end,
+        })
+      : lineConfigStore.getConfig(camera_id);
+  } catch (e) { return res.status(400).json({ error: e.message }); }
+
   if (!(await ensureWorker(res))) return;
 
   const candidates = caps.includes('face_recognition') ? personStore.getCandidatesPayload() : [];
@@ -101,10 +128,52 @@ router.post('/stream/start', requireAuth, async (req, res) => {
     const result = await bridge.startStream(
       camera_id, cam.name,
       cam.local_rtsp || `rtsp://localhost:8554/${camera_id}`,
-      candidates, threshold, dis_type, CROPS_DIR
+      candidates, threshold, dis_type, CROPS_DIR, lineConfig
     );
-    res.json({ started: true, camera_id, capabilities: caps, threshold, message: result.message });
+    res.json({ started: true, camera_id, capabilities: caps, threshold, line_config: lineConfig, message: result.message });
   } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Line-crossing config (the "dynamically drawn line") ─────────
+// A frontend lets an operator draw a line over the camera preview (as
+// normalized 0–1 fractions of frame width/height) and saves it here. It's
+// picked up automatically the next time that camera's face stream starts
+// (see /stream/start above), or you can pass line_* fields inline on that
+// call instead — both paths write to the same store.
+router.get('/stream/line-config/:cameraId', requireAuth, (req, res) => {
+  res.json({ camera_id: req.params.cameraId, ...lineConfigStore.getConfig(req.params.cameraId) });
+});
+
+router.put('/stream/line-config/:cameraId', requireAuth, async (req, res) => {
+  const { cameraId } = req.params;
+  if (!cameras.get(cameraId)) return res.status(404).json({ error: `Camera ${cameraId} not found` });
+
+  let cfg;
+  try { cfg = lineConfigStore.setConfig(cameraId, req.body || {}); }
+  catch (e) { return res.status(400).json({ error: e.message }); }
+
+  // If this camera's stream is already running, restart it so the new line
+  // takes effect immediately instead of waiting for the next manual start.
+  let restarted = false;
+  if (bridge.isReady() && bridge.isStreamActive(cameraId)) {
+    try {
+      const cam = cameras.get(cameraId);
+      const candidates = personStore.getCandidatesPayload();
+      await bridge.startStream(
+        cameraId, cam.name,
+        cam.local_rtsp || `rtsp://localhost:8554/${cameraId}`,
+        candidates, req.body?.threshold ?? 0.60, req.body?.dis_type ?? 0, CROPS_DIR, cfg
+      );
+      restarted = true;
+    } catch (e) { /* best-effort — config is saved either way */ }
+  }
+
+  res.json({ camera_id: cameraId, ...cfg, restarted });
+});
+
+router.delete('/stream/line-config/:cameraId', requireAuth, (req, res) => {
+  lineConfigStore.deleteConfig(req.params.cameraId);
+  res.json({ camera_id: req.params.cameraId, ...lineConfigStore.DEFAULTS });
 });
 
 router.post('/stream/stop', requireAuth, async (req, res) => {
@@ -121,6 +190,46 @@ router.get('/stream/result/:cameraId', requireAuth, (req, res) => {
   const result = bridge.getLatestStreamResult(req.params.cameraId);
   if (!result) return res.status(404).json({ error: 'No result yet — is the stream running?' });
   res.json({ camera_id: result.camera_id, camera_name: result.camera_name, faces: result.faces || [], updated_at: new Date().toISOString() });
+});
+
+// ── Live bounding boxes for frontend overlay rendering ──────────
+// Returns both raw pixel boxes (native frame resolution) AND normalized
+// (0–1) boxes, so the frontend can draw a canvas overlay on top of the
+// <video> element regardless of its rendered/display size — just multiply
+// box_normalized.x/y/w/h by the video element's current width/height.
+router.get('/stream/boxes/:cameraId', requireAuth, (req, res) => {
+  const result = bridge.getLatestStreamResult(req.params.cameraId);
+  if (!result) return res.status(404).json({ error: 'No result yet — is the stream running?' });
+
+  const fw = result.frame_width  || null;
+  const fh = result.frame_height || null;
+
+  const boxes = (result.faces || []).map(f => {
+    const [x, y, w, h] = f.box || [0, 0, 0, 0];
+    return {
+      box: { x, y, w, h }, // raw pixel box (native camera frame resolution)
+      box_normalized: (fw && fh) ? {
+        x: x / fw,
+        y: y / fh,
+        w: w / fw,
+        h: h / fh,
+      } : null,
+      is_known:  f.is_known || false,
+      person_id: f.match?.person_id || null,
+      name:      f.match?.name || null,
+      score:     f.score || 0,
+      gender:    f.gender || null,
+    };
+  });
+
+  res.json({
+    camera_id:    result.camera_id,
+    camera_name:  result.camera_name,
+    frame_width:  fw,
+    frame_height: fh,
+    boxes,
+    updated_at:   new Date().toISOString(),
+  });
 });
 
 // ── One-shot image analysis ───────────────────────────────────
@@ -140,6 +249,87 @@ router.post('/analyze', requireAuth, imageUpload.single('image'), async (req, re
     const faces    = (response.faces || []).map(f => filterFace(f, caps));
     res.json({ faces, face_count: faces.length, capabilities_used: caps, image_file: req.file.filename });
   } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Face clusters (recurring, not-yet-labeled strangers) ───────
+// Populated automatically from live streams (see the stream_match
+// listener above). Label a cluster to turn it into a recognizable Person.
+router.get('/clusters', requireAuth, (req, res) => {
+  res.json({ clusters: clusterStore.listClusters() });
+});
+
+router.get('/clusters/:id', requireAuth, (req, res) => {
+  const c = clusterStore.getCluster(req.params.id);
+  if (!c) return res.status(404).json({ error: 'Cluster not found' });
+  res.json({
+    cluster_id:      c.cluster_id,
+    seen_count:      c.seen_count,
+    embedding_count: c.embeddings.length,
+    camera_ids:      Array.from(c.camera_ids),
+    crop_filenames:  c.crop_filenames,
+    last_gender:     c.last_gender,
+    first_seen:      c.first_seen,
+    last_seen:       c.last_seen,
+  });
+});
+
+// Read/update the cosine similarity threshold used to decide whether a new
+// unknown face joins an existing cluster. Defaults to env var
+// CLUSTER_MATCH_THRESHOLD (or 0.60); changes here apply immediately and take
+// effect for the next ingested face, no restart required.
+router.get('/clusters/config/threshold', requireAuth, (req, res) => {
+  res.json({ threshold: clusterStore.getThreshold() });
+});
+
+router.put('/clusters/config/threshold', requireAuth, (req, res) => {
+  try {
+    const threshold = clusterStore.setThreshold(req.body?.threshold);
+    res.json({ threshold, message: 'Cluster match threshold updated.' });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// Discard a cluster (e.g. it's noise, or crops of unrelated people that got
+// merged) without creating/updating any person.
+router.delete('/clusters/:id', requireAuth, (req, res) => {
+  try { clusterStore.deleteCluster(req.params.id); res.json({ ok: true }); }
+  catch (e) { res.status(404).json({ error: e.message }); }
+});
+
+// Label a cluster: creates a new Person from its embeddings (or, if
+// person_id is supplied, merges its embeddings into an existing Person),
+// pushes the updated candidate list to the running worker, and removes the
+// cluster. From this point on the labeled face is recognized (is_known:
+// true) on future stream/analyze detections.
+router.post('/clusters/:id/label', requireAuth, async (req, res) => {
+  const cluster = clusterStore.getCluster(req.params.id);
+  if (!cluster) return res.status(404).json({ error: 'Cluster not found' });
+
+  const { name, note, person_id } = req.body || {};
+  if (!person_id && !name)
+    return res.status(400).json({ error: 'name is required (or pass person_id to merge into an existing person)' });
+
+  try {
+    let person;
+    if (person_id) {
+      person = personStore.getPerson(person_id);
+      if (!person) return res.status(404).json({ error: `Person ${person_id} not found` });
+    } else {
+      person = personStore.createPerson({ name, note });
+    }
+
+    personStore.addEmbeddings(person.person_id, cluster.embeddings, cluster.crop_filenames);
+    if (bridge.isReady()) await bridge.updateCandidates(personStore.getCandidatesPayload());
+
+    clusterStore.deleteCluster(cluster.cluster_id);
+
+    res.json({
+      person_id:       person.person_id,
+      name:            person.name,
+      embedding_count: personStore.getPerson(person.person_id).embeddings.length,
+      cluster_id:      cluster.cluster_id,
+      message:         'Cluster labeled — this face will now be recognized on future detections.',
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── Person management ─────────────────────────────────────────

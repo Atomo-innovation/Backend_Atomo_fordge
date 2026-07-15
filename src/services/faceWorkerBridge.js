@@ -21,6 +21,7 @@ class FaceWorkerBridge extends EventEmitter {
     this.stdoutBuf   = '';
     this.starting    = false;
     this.latestStreamResults = new Map();
+    this.activeStreams = new Set(); // camera_ids with a running stream thread
   }
 
   async start() {
@@ -65,6 +66,7 @@ class FaceWorkerBridge extends EventEmitter {
       this.proc.on('close', (code) => {
         console.log(`[FaceWorker] exited (code=${code})`);
         this.ready = false; this.starting = false; this.proc = null;
+        this.activeStreams.clear();
         for (const [, p] of this.pendingCmds) { clearTimeout(p.timer); p.reject(new Error('face_worker.py died')); }
         this.pendingCmds.clear();
         this.emit('exit', code);
@@ -126,12 +128,25 @@ class FaceWorkerBridge extends EventEmitter {
   recognizeImage(imgPath, candidates = [], threshold = 0.60, disType = 0, cropsDir = CROPS_DIR) {
     return this._send('recognize_image', { img_path: imgPath, candidates, threshold, dis_type: disType, crops_dir: cropsDir }, 20_000);
   }
-  startStream(cameraId, cameraName, rtspUrl, candidates = [], threshold = 0.60, disType = 0, cropsDir = CROPS_DIR) {
-    return this._send('start_stream', { camera_id: cameraId, camera_name: cameraName, rtsp_url: rtspUrl, candidates, threshold, dis_type: disType, crops_dir: cropsDir });
+  startStream(cameraId, cameraName, rtspUrl, candidates = [], threshold = 0.60, disType = 0, cropsDir = CROPS_DIR, lineConfig = {}) {
+    const {
+      enabled:  line_crossing_enabled = false,
+      line_y:      line_y             = 0.6,
+      direction:   line_direction     = 'in',
+      x_start:     line_x_start       = 0.0,
+      x_end:       line_x_end         = 1.0,
+    } = lineConfig;
+    return this._send('start_stream', {
+      camera_id: cameraId, camera_name: cameraName, rtsp_url: rtspUrl,
+      candidates, threshold, dis_type: disType, crops_dir: cropsDir,
+      line_crossing_enabled, line_y, line_direction, line_x_start, line_x_end,
+    }).then(result => { this.activeStreams.add(cameraId); return result; });
   }
   stopStream(cameraId) {
-    return this._send('stop_stream', { camera_id: cameraId });
+    return this._send('stop_stream', { camera_id: cameraId })
+      .then(result => { this.activeStreams.delete(cameraId); return result; });
   }
+  isStreamActive(cameraId) { return this.activeStreams.has(cameraId); }
   updateCandidates(candidates = []) {
     return this._send('update_candidates', { candidates });
   }

@@ -1,238 +1,257 @@
 /**
- * customModels.js
+ * customModels.js — extract & register custom model ZIPs.
  *
- * Handles uploading and registering custom NPU model packages.
+ * Supported ZIP layouts
+ * ─────────────────────
+ * Layout A — NPU (.nb + .so)        ← existing behaviour, unchanged
+ *   animal.nb
+ *   libnn_animal.so
+ *   data.yaml          (class names)
  *
- * Expected ZIP structure (flat or in one subfolder):
- *   animal_pack.zip
- *   ├── animal.nb              ← compiled NPU model
- *   ├── libnn_animal.so        ← NPU runtime library for this model
- *   └── data.yaml              ← class names + metadata
+ * Layout B — TFLite                 ← NEW
+ *   model.tflite
+ *   classes.txt  (or labels.txt / names.txt / data.yaml)
  *
- * data.yaml format (standard YOLO-style):
- *   names:
- *     0: cow
- *     1: goat
- *     2: dog
- *   # or as a list:
- *   # names: [cow, goat, dog]
- *   nc: 3                       # optional, number of classes
- *   input_size: 640             # optional, defaults to 640
- *   conf_threshold: 0.45        # optional default confidence
- *   nms_threshold: 0.56         # optional default NMS
+ * Layout C — ONNX                   ← NEW
+ *   model.onnx
+ *   classes.txt  (or labels.txt / names.txt / data.yaml)
  *
- * On upload:
- *   1. Save zip to uploads/model_packages/
- *   2. Extract to models/custom/<model_id>/
- *   3. Locate exactly one .nb and one .so file (any names)
- *   4. Parse data.yaml for class names
- *   5. Register the model in the store with capabilities = class names
- *      (each class becomes a checkbox the user can toggle on/off)
- *   6. Move .so into lib/custom/<model_id>/ for clean separation
+ * The registered model object always contains:
+ *   format          'nb' | 'tflite' | 'onnx'
+ *   model_path      absolute path to the model file
+ *   library_path    absolute path to .so  (nb only, else null)
+ *   script_path     absolute path to the detector Python script
+ *   class_names     string[]
+ *   input_size      number (default 640; read from yaml if present)
+ *   default_conf    number
+ *   default_nms     number
  */
 
-const fs   = require('fs');
-const path = require('path');
-const yaml = require('js-yaml');
-const AdmZip = require('adm-zip');
-const { v4: uuidv4 } = require('uuid');
-const { models } = require('../store');
+'use strict';
 
+const path    = require('path');
+const fs      = require('fs');
+const AdmZip  = require('adm-zip');
+const yaml    = require('js-yaml');          // npm install js-yaml
+const { models, uuidv4 } = require('../store');
+
+// ── Directories ───────────────────────────────────────────────────────────────
 const PROJECT_ROOT  = path.join(__dirname, '../..');
-const UPLOAD_DIR    = path.join(PROJECT_ROOT, 'uploads', 'model_packages');
-const MODELS_DIR    = path.join(PROJECT_ROOT, 'models', 'custom');
-const LIB_DIR       = path.join(PROJECT_ROOT, 'lib', 'custom');
+const UPLOAD_DIR    = path.join(PROJECT_ROOT, 'uploads');
+const EXTRACT_BASE  = path.join(PROJECT_ROOT, 'models');
 const DETECTORS_DIR = path.join(PROJECT_ROOT, 'detectors');
 
-// Generic detector script used by ALL custom models (you write this once)
-const GENERIC_DETECTOR = 'generic_detector.py';
+// Built-in detector scripts for each format
+const DETECTOR_SCRIPTS = {
+  nb:      path.join(DETECTORS_DIR, 'generic_detector.py'),
+  tflite:  path.join(DETECTORS_DIR, 'tflite_detector.py'),
+  onnx:    path.join(DETECTORS_DIR, 'onnx_detector.py'),
+};
 
-[UPLOAD_DIR, MODELS_DIR, LIB_DIR].forEach(d => fs.mkdirSync(d, { recursive: true }));
+[UPLOAD_DIR, EXTRACT_BASE].forEach(d => fs.mkdirSync(d, { recursive: true }));
 
-/**
- * Recursively find all files matching a predicate within a directory.
- */
-function findFiles(dir, predicate, found = []) {
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      findFiles(full, predicate, found);
-    } else if (predicate(entry.name)) {
-      found.push(full);
-    }
-  }
-  return found;
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/** Pick the first file in `files` whose extension matches one of `exts`. */
+function pick(files, ...exts) {
+  return files.find(f => exts.includes(path.extname(f).toLowerCase())) || null;
 }
 
 /**
- * Parse data.yaml into a normalised { names: string[], ...meta } object.
- * Supports both dict form ({0: 'cow', 1: 'goat'}) and list form (['cow','goat']).
+ * Parse class names from whatever metadata file is present.
+ * Supports:
+ *   data.yaml / config.yaml  — YOLO-style: { names: ['dog','cat',...] }
+ *   *.txt / *.names / *.labels — one class per line
  */
-function parseDataYaml(yamlPath) {
-  const raw = fs.readFileSync(yamlPath, 'utf8');
-  const doc = yaml.load(raw) || {};
-
-  let names = [];
-  if (Array.isArray(doc.names)) {
-    names = doc.names.map(String);
-  } else if (doc.names && typeof doc.names === 'object') {
-    // dict form: {0: 'cow', 1: 'goat'} — sort by numeric key
-    names = Object.entries(doc.names)
-      .sort((a, b) => Number(a[0]) - Number(b[0]))
-      .map(([, v]) => String(v));
+function parseClassNames(dir, files) {
+  // 1. YAML first
+  const yamlFile = files.find(f =>
+    ['.yaml', '.yml'].includes(path.extname(f).toLowerCase())
+  );
+  if (yamlFile) {
+    try {
+      const doc = yaml.load(fs.readFileSync(path.join(dir, yamlFile), 'utf8'));
+      if (Array.isArray(doc?.names) && doc.names.length > 0) return doc.names.map(String);
+    } catch {}
   }
 
-  if (names.length === 0) {
-    throw new Error('data.yaml has no "names" field (expected list or dict of class names)');
+  // 2. Plain text file
+  const txtFile = files.find(f =>
+    ['.txt', '.names', '.labels'].includes(path.extname(f).toLowerCase())
+  );
+  if (txtFile) {
+    const lines = fs.readFileSync(path.join(dir, txtFile), 'utf8')
+      .split('\n')
+      .map(l => l.trim())
+      .filter(Boolean);
+    if (lines.length > 0) return lines;
   }
 
-  return {
-    names,
-    nc:              doc.nc || names.length,
-    input_size:      doc.input_size || doc.imgsz || 640,
-    conf_threshold:  doc.conf_threshold ?? doc.conf ?? 0.45,
-    nms_threshold:   doc.nms_threshold ?? doc.nms ?? 0.56,
-    raw:             doc,
-  };
+  return [];
 }
 
 /**
- * Process an uploaded zip file:
- *  - extract
- *  - validate contents (.nb, .so, data.yaml)
- *  - register model in store
- *
- * @param {string} zipPath  path to the uploaded .zip
- * @param {object} opts     { name, description }
- * @returns the registered model object
+ * Read optional numeric fields from data.yaml.
+ * Returns { input_size, default_conf, default_nms } with safe defaults.
  */
-function registerModelFromZip(zipPath, opts = {}) {
-  const modelId   = 'mdl_custom_' + uuidv4().slice(0, 8);
-  const extractDir = path.join(MODELS_DIR, modelId);
+function parseYamlConfig(dir, files) {
+  const yamlFile = files.find(f =>
+    ['.yaml', '.yml'].includes(path.extname(f).toLowerCase())
+  );
+  const cfg = { input_size: 640, default_conf: 0.45, default_nms: 0.56 };
+  if (!yamlFile) return cfg;
+  try {
+    const doc = yaml.load(fs.readFileSync(path.join(dir, yamlFile), 'utf8')) || {};
+    if (typeof doc.input_size  === 'number') cfg.input_size  = doc.input_size;
+    if (typeof doc.conf        === 'number') cfg.default_conf = doc.conf;
+    if (typeof doc.nms         === 'number') cfg.default_nms  = doc.nms;
+  } catch {}
+  return cfg;
+}
+
+// ── Main export ───────────────────────────────────────────────────────────────
+
+/**
+ * Extract `zipPath`, detect model format, register in the models Map.
+ * Returns the registered model object.
+ * Throws on any validation error so the route can return HTTP 422.
+ */
+function registerModelFromZip(zipPath, { name, description } = {}) {
+  const modelId   = 'mdl_custom_' + uuidv4().replace(/-/g, '').slice(0, 8);
+  const extractDir = path.join(EXTRACT_BASE, modelId);
   fs.mkdirSync(extractDir, { recursive: true });
 
-  // ── 1. Extract ────────────────────────────────────────────────────────────
-  let zip;
+  // Extract
   try {
-    zip = new AdmZip(zipPath);
-    zip.extractAllTo(extractDir, true);
+    const zip = new AdmZip(zipPath);
+    zip.extractAllTo(extractDir, /*overwrite*/ true);
   } catch (err) {
-    cleanup(extractDir);
-    throw new Error(`Failed to extract zip: ${err.message}`);
+    fs.rmSync(extractDir, { recursive: true, force: true });
+    throw new Error(`Failed to extract ZIP: ${err.message}`);
   }
 
-  // ── 2. Locate required files (search recursively — handles nested folders) ──
-  const nbFiles   = findFiles(extractDir, n => n.toLowerCase().endsWith('.nb'));
-  const soFiles   = findFiles(extractDir, n => n.toLowerCase().endsWith('.so'));
-  const yamlFiles = findFiles(extractDir, n => /^data\.ya?ml$/i.test(n));
+  // Flat list of filenames (ignore sub-directories for now)
+  const files = fs.readdirSync(extractDir).filter(f =>
+    fs.statSync(path.join(extractDir, f)).isFile()
+  );
 
-  const errors = [];
-  if (nbFiles.length === 0)   errors.push('No .nb model file found');
-  if (nbFiles.length > 1)     errors.push(`Multiple .nb files found: ${nbFiles.map(f => path.basename(f)).join(', ')}`);
-  if (soFiles.length === 0)   errors.push('No .so library file found (expected libnn_*.so)');
-  if (soFiles.length > 1)     errors.push(`Multiple .so files found: ${soFiles.map(f => path.basename(f)).join(', ')}`);
-  if (yamlFiles.length === 0) errors.push('No data.yaml found');
-  if (yamlFiles.length > 1)   errors.push(`Multiple data.yaml files found`);
+  // ── Detect format ────────────────────────────────────────────────────────
+  const nbFile      = pick(files, '.nb');
+  const tfliteFile  = pick(files, '.tflite');
+  const onnxFile    = pick(files, '.onnx');
+  const soFile      = pick(files, '.so');
 
-  if (errors.length > 0) {
-    cleanup(extractDir);
-    throw new Error(`Invalid model package: ${errors.join('; ')}`);
+  let format, modelFile;
+
+  if (tfliteFile) {
+    format    = 'tflite';
+    modelFile = tfliteFile;
+  } else if (onnxFile) {
+    format    = 'onnx';
+    modelFile = onnxFile;
+  } else if (nbFile) {
+    format    = 'nb';
+    modelFile = nbFile;
+  } else {
+    fs.rmSync(extractDir, { recursive: true, force: true });
+    throw new Error('ZIP must contain a .tflite, .onnx, or .nb model file');
   }
 
-  const nbFile   = nbFiles[0];
-  const soFile   = soFiles[0];
-  const yamlFile = yamlFiles[0];
-
-  // ── 3. Parse data.yaml ───────────────────────────────────────────────────
-  let meta;
-  try {
-    meta = parseDataYaml(yamlFile);
-  } catch (err) {
-    cleanup(extractDir);
-    throw new Error(`Invalid data.yaml: ${err.message}`);
+  // .nb requires a matching .so
+  if (format === 'nb' && !soFile) {
+    fs.rmSync(extractDir, { recursive: true, force: true });
+    throw new Error('ZIP with .nb model must also include a libnn_*.so library file');
   }
 
-  // ── 4. Move .so into lib/custom/<model_id>/ for clean separation ─────────
-  const libDestDir = path.join(LIB_DIR, modelId);
-  fs.mkdirSync(libDestDir, { recursive: true });
-  const soDest = path.join(libDestDir, path.basename(soFile));
-  fs.renameSync(soFile, soDest);
-
-  // ── 5. Check generic detector script exists ───────────────────────────────
-  const detectorScriptPath = path.join(DETECTORS_DIR, GENERIC_DETECTOR);
-  if (!fs.existsSync(detectorScriptPath)) {
-    console.warn(`[customModels] WARNING: ${GENERIC_DETECTOR} not found in detectors/. ` +
-      `Worker will fail to start until you add it.`);
+  // Class names are required for all formats
+  const classNames = parseClassNames(extractDir, files);
+  if (classNames.length === 0) {
+    fs.rmSync(extractDir, { recursive: true, force: true });
+    throw new Error(
+      'ZIP must include a class-names file: data.yaml (YOLO format with `names:`), ' +
+      'or a plain .txt / .names / .labels file (one class per line)'
+    );
   }
 
-  // ── 6. Register in store ──────────────────────────────────────────────────
-  const name = opts.name || path.basename(zipPath, '.zip');
+  // Check the detector script exists on disk
+  const scriptPath = DETECTOR_SCRIPTS[format];
+  if (!fs.existsSync(scriptPath)) {
+    fs.rmSync(extractDir, { recursive: true, force: true });
+    throw new Error(
+      `Detector script not found: ${scriptPath}. ` +
+      `Please add detectors/${format}_detector.py to your project.`
+    );
+  }
+
+  const yamlCfg = parseYamlConfig(extractDir, files);
+
+  // ── Build model record ───────────────────────────────────────────────────
+  const displayName = name?.trim() ||
+    path.basename(modelFile, path.extname(modelFile))
+        .replace(/[_-]/g, ' ')
+        .replace(/\b\w/g, c => c.toUpperCase());
 
   const model = {
-    id:                modelId,
-    name,
-    description:       opts.description || `Custom model: ${name}`,
-    type:              'custom',
-    is_active:         true,
-    tab_created:       true,
-    version:           '1.0.0',
+    id:           modelId,
+    name:         displayName,
+    description:  description || '',
+    type:         'custom',
+    format,                                             // 'nb' | 'tflite' | 'onnx'
+    is_active:    true,
+    tab_created:  true,
+    version:      '1.0.0',
 
-    // Paths — all absolute so worker.js can use them directly
-    script_path:       path.join(DETECTORS_DIR, GENERIC_DETECTOR),
-    model_path:        nbFile,
-    library_path:      soDest,
-    data_yaml_path:    yamlFile,
+    // Paths
+    extract_dir:  extractDir,
+    script_path:  scriptPath,
+    model_path:   path.join(extractDir, modelFile),
+    library_path: format === 'nb'
+                    ? path.join(extractDir, soFile)
+                    : null,                             // ← null for tflite / onnx
 
-    // Each detected class becomes a capability checkbox the user can toggle.
-    // e.g. ["cow", "goat", "dog"] → user can enable detection for just "cow"
-    capabilities:      meta.names,
-    class_names:       meta.names,
+    // Class info
+    class_names:  classNames,
+    capabilities: classNames,                          // alias used by detect routes
 
-    // Defaults from data.yaml, can be overridden per-worker at start time
-    default_conf:      meta.conf_threshold,
-    default_nms:       meta.nms_threshold,
-    input_size:        meta.input_size,
+    // Inference defaults (from yaml or hard-coded)
+    input_size:   yamlCfg.input_size,
+    default_conf: yamlCfg.default_conf,
+    default_nms:  yamlCfg.default_nms,
 
-    assigned_cameras:  [],
-    format:            'nb',
-    test_passed:       null,        // set true after /validate or /test
-    created_at:        new Date().toISOString(),
-    extract_dir:       extractDir,
+    assigned_cameras: [],
+    created_at: new Date().toISOString(),
   };
 
   models.set(modelId, model);
+
+  // Clean up the raw zip
+  try { fs.unlinkSync(zipPath); } catch {}
+
+  console.log(
+    `[customModels] Registered ${modelId} (${format}) — ` +
+    `${classNames.length} classes: ${classNames.join(', ')}`
+  );
 
   return model;
 }
 
 /**
- * Remove a custom model: delete files, remove from store.
+ * Delete a custom model: remove its extracted files and deregister it.
  */
 function deleteCustomModel(modelId) {
   const model = models.get(modelId);
   if (!model) throw new Error(`Model ${modelId} not found`);
-  if (model.type !== 'custom') throw new Error('Only custom models can be deleted');
 
-  // Remove extracted model directory
   if (model.extract_dir && fs.existsSync(model.extract_dir)) {
     fs.rmSync(model.extract_dir, { recursive: true, force: true });
   }
-  // Remove library directory
-  const libDir = path.dirname(model.library_path || '');
-  if (libDir.includes(LIB_DIR) && fs.existsSync(libDir)) {
-    fs.rmSync(libDir, { recursive: true, force: true });
-  }
 
   models.delete(modelId);
-}
-
-function cleanup(dir) {
-  try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+  console.log(`[customModels] Deleted ${modelId}`);
 }
 
 module.exports = {
+  UPLOAD_DIR,
   registerModelFromZip,
   deleteCustomModel,
-  parseDataYaml,
-  UPLOAD_DIR,
 };
